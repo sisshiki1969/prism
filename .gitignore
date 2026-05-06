@@ -72,5 +72,6 @@ out.svg
 compile_commands.json
 .cache/
 .vscode/
+.claude/
 
 tags

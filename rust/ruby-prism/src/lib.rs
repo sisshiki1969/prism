@@ -19,7 +19,7 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
 pub use self::bindings::*;
-use ruby_prism_sys::{pm_comment_t, pm_comment_type_t, pm_constant_id_list_t, pm_constant_id_t, pm_diagnostic_t, pm_integer_t, pm_location_t, pm_magic_comment_t, pm_node_destroy, pm_node_list, pm_node_t, pm_parse, pm_parser_free, pm_parser_init, pm_parser_t};
+use ruby_prism_sys::{pm_comment_t, pm_comment_type_t, pm_constant_id_list_t, pm_constant_id_t, pm_diagnostic_t, pm_integer_t, pm_location_t, pm_magic_comment_t, pm_node_destroy, pm_node_list, pm_node_t, pm_options_free, pm_options_line_set, pm_options_scope_forwarding_set, pm_options_scope_init, pm_options_scopes_init, pm_options_t, pm_parse, pm_parser_free, pm_parser_init, pm_parser_t, pm_string_constant_init};
 
 /// A range in the source file.
 pub struct Location<'pr> {
@@ -696,6 +696,239 @@ pub fn parse(source: &[u8]) -> ParseResult<'_> {
         let uninit = Box::into_raw(uninit);
 
         pm_parser_init((*uninit).as_mut_ptr(), source.as_ptr(), source.len(), std::ptr::null());
+
+        let parser = (*uninit).assume_init_mut();
+        let parser = NonNull::new_unchecked(parser);
+
+        let node = pm_parse(parser.as_ptr());
+        let node = NonNull::new_unchecked(node);
+
+        ParseResult { source, parser, node }
+    }
+}
+
+/// A wrapper around `pm_options_t` plus the Rust-side storage
+/// that backs the scope-locals byte buffers Prism reads. The
+/// scope array and per-scope locals arrays are still owned by
+/// Prism's C-side allocator (`xcalloc`/`xfree`) and released in
+/// `Drop` via `pm_options_free`; the local-name byte buffers
+/// themselves are owned by `scopes_storage` here, and the
+/// per-local `pm_string_t` slots are initialized as
+/// `PM_STRING_CONSTANT` pointing into them, so Prism never tries
+/// to free them.
+///
+/// Use `Options::new()` to start an empty option block, chain field
+/// setters (`line`, [`scopes`](Options::scopes), …), then pass the
+/// result by reference to [`parse_with_options`]. `pm_parser_init`
+/// copies everything it needs out of the options block (scope
+/// locals are `xmalloc`/`memcpy`'d into the parser's own scope
+/// stack), so `Options` may be dropped as soon as
+/// `parse_with_options` returns.
+///
+/// Currently only the fields needed by `eval` / `binding.eval`
+/// support are exposed (line offset and the surrounding-locals
+/// scopes). Other Prism options (`encoding`, `frozen_string_literal`,
+/// `partial_script`, …) can be added by chaining setters that wrap
+/// the corresponding `pm_options_*_set` helper.
+pub struct Options {
+    inner: pm_options_t,
+    /// Owns the per-scope local-name byte buffers that the
+    /// `pm_options_t.scopes[i].locals[j]` `pm_string_t` slots
+    /// (initialized as `PM_STRING_CONSTANT`) borrow from. Mirrors
+    /// the shape of `inner.scopes`: outer index = scope, inner
+    /// index = local within that scope.
+    scopes_storage: Vec<Scope>,
+}
+
+/// One frame of locals for [`Options::scopes`]. A `Scope` is a
+/// staging value: building one allocates nothing in Prism's heap;
+/// it just stows the local-name byte buffers and the forwarding
+/// flag bits. `Options::scopes` consumes the `Vec<Scope>`, moves
+/// it into the `Options`'s own storage, and points each Prism
+/// `pm_string_t` (initialized as `PM_STRING_CONSTANT` via
+/// `pm_string_constant_init`) at the corresponding owned byte
+/// buffer. The scope-array slots and per-scope locals arrays
+/// themselves are still allocated by Prism (`xcalloc`'d).
+pub struct Scope {
+    locals: Vec<Vec<u8>>,
+    forwarding: u8,
+}
+
+impl Scope {
+    /// Build a non-forwarding scope from the given locals.
+    /// `locals` is anything iterable yielding byte-slice-shaped
+    /// items (`String`, `&str`, `Vec<u8>`, `&[u8]`, …).
+    #[must_use]
+    pub fn new<I, S>(locals: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<[u8]>,
+    {
+        Self {
+            locals: locals.into_iter().map(|s| s.as_ref().to_vec()).collect(),
+            forwarding: 0,
+        }
+    }
+
+    /// Set the forwarding flag bits (any combination of
+    /// `PM_OPTIONS_SCOPE_FORWARDING_{POSITIONALS,KEYWORDS,BLOCK,ALL}`).
+    /// Only relevant when the surrounding scope uses `...` forwarding;
+    /// leave at the default `0` for ordinary eval contexts.
+    #[must_use]
+    pub fn forwarding(mut self, flags: u8) -> Self {
+        self.forwarding = flags;
+        self
+    }
+}
+
+impl Options {
+    /// Returns a fresh, all-zero options block with no scope-locals
+    /// storage. An all-zero `pm_options_t` is `pm_options_free`-safe
+    /// (every owned pointer is null, every count is zero).
+    #[must_use]
+    pub fn new() -> Self {
+        // SAFETY: `pm_options_t` is a plain C-style struct; an
+        // all-zero bit pattern matches its documented "default"
+        // behaviour (no scopes, line=0 (treated as 1 by Prism),
+        // version unset, every bool false, no shebang callback).
+        Self {
+            inner: unsafe { std::mem::zeroed() },
+            scopes_storage: Vec::new(),
+        }
+    }
+
+    /// Sets the 1-indexed starting line for the parsed source. Used
+    /// by `eval(code, _, _, lineno)` so error locations reference
+    /// the caller's line numbering instead of starting at 1.
+    #[must_use]
+    pub fn line(mut self, line: i32) -> Self {
+        // SAFETY: `&mut self.inner` points at a valid `pm_options_t`.
+        unsafe { pm_options_line_set(&mut self.inner, line) };
+        self
+    }
+
+    /// Install the surrounding-locals scope chain in one shot.
+    /// `scopes` must be in **outermost → innermost** order (Prism's
+    /// documented convention): the last entry describes the
+    /// lexically-closest enclosing scope, which `pm_parser_init`
+    /// then makes the eval body's own scope.
+    ///
+    /// The byte buffers backing each local name are moved into
+    /// `Options`'s own storage; Prism only sees `PM_STRING_CONSTANT`
+    /// pointers into them, so it never frees them itself.
+    ///
+    /// Replaces any previously installed scopes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any of the Prism scope/locals array allocations
+    /// (`xcalloc` for the scope array or per-scope locals array)
+    /// fails — i.e. on OOM.
+    #[must_use]
+    pub fn scopes(mut self, scopes: Vec<Scope>) -> Self {
+        // Drop any previously-installed scope chain. `pm_options_free`
+        // walks `scopes_count` entries, calls `pm_string_cleanup` on
+        // each local (a no-op for `PM_STRING_CONSTANT`), and `xfree`s
+        // each locals array + the scopes array. Setting the count and
+        // pointer back to zero/null means the next free in `Drop` is
+        // a no-op.
+        // SAFETY: `&mut self.inner` points at a valid `pm_options_t`.
+        unsafe { pm_options_free(&mut self.inner) };
+        self.inner.scopes = std::ptr::null_mut();
+        self.inner.scopes_count = 0;
+        self.scopes_storage.clear();
+
+        if scopes.is_empty() {
+            return self;
+        }
+
+        // Take ownership of the staged scopes (and thus their
+        // local-name byte buffers) before handing borrowing pointers
+        // into them to Prism. `Vec<u8>` heap allocations don't move
+        // when their owning `Vec` is moved, so the pointers we hand
+        // to `pm_string_constant_init` below stay valid for as long
+        // as `self.scopes_storage` does — i.e. for the lifetime of
+        // `self`.
+        self.scopes_storage = scopes;
+        let scopes_count = self.scopes_storage.len();
+
+        // Allocate the Prism scope array (`xcalloc`'d).
+        // SAFETY: `&mut self.inner` is valid; the helper just calls
+        // `xcalloc` and stores the result on `self.inner`.
+        assert!(unsafe { pm_options_scopes_init(&mut self.inner, scopes_count) }, "pm_options_scopes_init OOM");
+
+        for i in 0..scopes_count {
+            let scope = &self.scopes_storage[i];
+            let locals_count = scope.locals.len();
+
+            // SAFETY: `i < scopes_count == self.inner.scopes_count`.
+            let target = unsafe { self.inner.scopes.add(i) };
+            // SAFETY: `target` is in-bounds and was zeroed by `xcalloc`.
+            assert!(unsafe { pm_options_scope_init(target, locals_count) }, "pm_options_scope_init OOM");
+            // SAFETY: `target` is in-bounds and just initialized.
+            unsafe { pm_options_scope_forwarding_set(target, scope.forwarding) };
+
+            for (j, name) in scope.locals.iter().enumerate() {
+                // SAFETY: `j < locals_count == (*target).locals_count`.
+                let local = unsafe { (*target).locals.add(j) };
+                // SAFETY: `local` is a freshly-zeroed `pm_string_t`.
+                // `name.as_ptr()` is valid for `name.len()` bytes and
+                // outlives the eventual `pm_parser_init` call (which
+                // copies these bytes into the parser's own scope
+                // stack) because `self.scopes_storage` owns `name`
+                // for the rest of `self`'s lifetime.
+                unsafe {
+                    pm_string_constant_init(local, name.as_ptr().cast::<c_char>(), name.len());
+                }
+            }
+        }
+
+        self
+    }
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Options {
+    fn drop(&mut self) {
+        // SAFETY: `pm_options_free` walks `scopes`/`locals` and
+        // `xfree`s the Prism-allocated arrays; for each
+        // `PM_STRING_CONSTANT` local it just clears the slot
+        // (no-op cleanup), so it never touches `self.scopes_storage`'s
+        // byte buffers (which are dropped by the implicit
+        // `Vec` drop afterwards). Safe on an all-zero `pm_options_t`.
+        unsafe { pm_options_free(&mut self.inner) };
+    }
+}
+
+/// Parses the given source string with the supplied [`Options`] and
+/// returns a parse result. `pm_parser_init` reads each option field
+/// it cares about (scope-locals are `xmalloc`/`memcpy`'d into the
+/// parser's own scope stack, scalars are copied into parser fields)
+/// and does not retain any pointer back into the `Options` block, so
+/// the borrow only needs to last for this call — the caller is free
+/// to drop `options` as soon as `parse_with_options` returns.
+///
+/// # Panics
+///
+/// Panics if the parser fails to initialize.
+#[must_use]
+pub fn parse_with_options<'pr>(source: &'pr [u8], options: &Options) -> ParseResult<'pr> {
+    unsafe {
+        let uninit = Box::new(MaybeUninit::<pm_parser_t>::uninit());
+        let uninit = Box::into_raw(uninit);
+
+        // SAFETY: `options.inner` is a live `pm_options_t` for the
+        // duration of this call (caller holds a shared borrow for
+        // `&Options`, which also keeps `scopes_storage` and the
+        // local-name byte buffers alive); `pm_parser_init` only
+        // reads from it.
+        let options_ptr: *const pm_options_t = &options.inner;
+        pm_parser_init((*uninit).as_mut_ptr(), source.as_ptr(), source.len(), options_ptr);
 
         let parser = (*uninit).assume_init_mut();
         let parser = NonNull::new_unchecked(parser);
