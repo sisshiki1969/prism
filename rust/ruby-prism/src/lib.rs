@@ -738,6 +738,9 @@ pub struct Options {
     /// the shape of `inner.scopes`: outer index = scope, inner
     /// index = local within that scope.
     scopes_storage: Vec<Scope>,
+    /// Owns the bytes the `pm_options_t.filepath` `pm_string_t`
+    /// (initialized as `PM_STRING_CONSTANT`) borrows from.
+    filepath_storage: Vec<u8>,
 }
 
 /// One frame of locals for [`Options::scopes`]. A `Scope` is a
@@ -794,7 +797,33 @@ impl Options {
         Self {
             inner: unsafe { std::mem::zeroed() },
             scopes_storage: Vec::new(),
+            filepath_storage: Vec::new(),
         }
+    }
+
+    /// Sets the name of the file being parsed. Prism reads it for
+    /// `__FILE__` wherever the parser itself needs its value — e.g.
+    /// the duplicated-key warning compares and prints a `__FILE__`
+    /// key by it (`pm_static_literals_add`) — so a `__FILE__` key
+    /// and an equal String literal are seen as the same key.
+    ///
+    /// The bytes are copied into `Options`'s own storage and handed
+    /// to Prism as a `PM_STRING_CONSTANT`, so they may contain any
+    /// bytes (no NUL terminator is required, unlike
+    /// `pm_options_filepath_set`).
+    #[must_use]
+    pub fn filepath(mut self, filepath: &[u8]) -> Self {
+        self.filepath_storage = filepath.to_vec();
+        // SAFETY: `self.inner.filepath` is a valid `pm_string_t`
+        // (zeroed or previously constant-initialized; freeing a
+        // `PM_STRING_CONSTANT` is a no-op, so overwriting it leaks
+        // nothing). The pointer is valid for `len` bytes for the
+        // rest of `self`'s lifetime: `filepath_storage` owns them and
+        // is only replaced here, together with this slot.
+        unsafe {
+            pm_string_constant_init(&mut self.inner.filepath, self.filepath_storage.as_ptr().cast::<c_char>(), self.filepath_storage.len());
+        }
+        self
     }
 
     /// Sets the 1-indexed starting line for the parsed source. Used
